@@ -1,272 +1,4 @@
-package main
 
-import (
-	"encoding/json"
-	"fmt"
-	"io"
-	"log"
-	"net/http"
-	"net/url"
-	"os"
-	"regexp"
-	"strconv"
-	"strings"
-	"sync"
-	"time"
-)
-
-// --- CONFIGURATION ---
-const (
-	// THE SPECIAL API URL FOR PAGE 1
-	API_URL_PAGE_1 = "https://www.firstcry.com/svcs/SearchResult.svc/GetSearchResultProductsFilters?PageNo=1&PageSize=100&SortExpression=NewArrivals&OnSale=5&SearchString=brand&SubCatId=&BrandId=&Price=&Age=&Color=&OptionalFilter=&OutOfStock=&Type1=&Type2=&Type3=&Type4=&Type5=&Type6=&Type7=&Type8=&Type9=&Type10=&Type11=&Type12=&Type13=&Type14=&Type15=&combo=&discount=&searchwithincat=&ProductidQstr=&searchrank=&pmonths=&cgen=&PriceQstr=&DiscountQstr=&MasterBrand=113&sorting=&Rating=&Offer=&skills=&material=&curatedcollections=&measurement=&gender=&exclude=&premium=&pcode=680566&isclub=0&deliverytype="
-	// THE REGULAR API URL TEMPLATE FOR PAGES 2 AND BEYOND
-	API_URL_PAGING_TEMPLATE = "https://www.firstcry.com/svcs/SearchResult.svc/GetSearchResultProductsPaging?PageNo=%d&PageSize=20&SortExpression=NewArrivals&OnSale=5&SearchString=brand&SubCatId=&BrandId=&Price=&Age=&Color=&OptionalFilter=&OutOfStock=&Type1=&Type2=&Type3=&Type4=&Type5=&Type6=&Type7=&Type8=&Type9=&Type10=&Type11=&Type12=&Type13=&Type14=&Type15=&combo=&discount=&searchwithincat=&ProductidQstr=&searchrank=&pmonths=&cgen=&PriceQstr=&DiscountQstr=&sorting=&MasterBrand=113&Rating=&Offer=&skills=&material=&curatedcollections=&measurement=&gender=&exclude=&premium=&pcode=680566&isclub=0&deliverytype="
-	PAGES_TO_SCAN           = 6 // Total pages to check (1 initial + 9 paging)
-	TELEGRAM_BOT_TOKEN      = "8222224289:AAFDgJ2C0KSTks9lLhPKtUtR1KzqraNkybI"
-	TELEGRAM_CHAT_ID        = "-4985438208"
-	ADMIN_CHAT_ID           = "837428747"
-	SEEN_ITEMS_FILE         = "seen_hotwheels_go.txt"
-)
-
-// --- SHARED STATE & DATA STRUCTS ---
-var (
-	mutex          sync.Mutex
-	checkInterval  = 30 * time.Second
-	isPaused       = false
-	heartbeatMuted = false
-	seenItems      = make(map[string]bool) // The KEY will now be the ProductInfoID
-	checkHistory   []CheckResult
-)
-
-// --- TELEGRAM STRUCTS ---
-type TelegramUpdateResponse struct {
-	Ok     bool     `json:"ok"`
-	Result []Update `json:"result"`
-}
-type Update struct {
-	UpdateID int     `json:"update_id"`
-	Message  Message `json:"message"`
-}
-type Message struct {
-	Text string `json:"text"`
-	Chat Chat   `json:"chat"`
-}
-type Chat struct {
-	ID int64 `json:"id"`
-}
-
-// --- API STRUCTS (UPDATED) ---
-type OuterEnvelope struct {
-	ProductResponse string `json:"ProductResponse"`
-}
-type InnerData struct {
-	Products []Product `json:"Products"`
-}
-type Product struct {
-	ProductID     string `json:"PId"`
-	ProductInfoID string `json:"PInfId"` // THE TRUE UNIQUE ID
-	ProductName   string `json:"PNm"`
-	Price         string `json:"discprice"`
-	StockStatus   string `json:"CrntStock"`
-}
-
-// --- HISTORY STRUCT ---
-type CheckResult struct {
-	Timestamp     time.Time
-	FoundProducts []Product
-}
-
-// --- HELPER FUNCTIONS ---
-var nonAlphanumericRegex = regexp.MustCompile(`[^a-zA-Z0-9 ]+`)
-var spaceRegex = regexp.MustCompile(`\s+`)
-
-func slugify(s string) string {
-	s = strings.ToLower(s)
-	s = nonAlphanumericRegex.ReplaceAllString(s, "")
-	s = spaceRegex.ReplaceAllString(s, "-")
-	return s
-}
-
-// This function now uses the correct PId for the URL path
-func constructFullURL(p Product) string {
-	productSlug := slugify(p.ProductName)
-	return fmt.Sprintf("https://www.firstcry.com/hot-wheels/%s/%s/product-detail", productSlug, p.ProductID)
-}
-
-func sendTelegramMessage(chatID, message string) {
-	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", TELEGRAM_BOT_TOKEN)
-	payload := url.Values{}
-	payload.Set("chat_id", chatID)
-	payload.Set("text", message)
-	payload.Set("parse_mode", "HTML")
-	_, err := http.PostForm(apiURL, payload)
-	if err != nil {
-		log.Printf("❌ Failed to send Telegram message: %v", err)
-	}
-}
-
-func loadSeenItems() {
-	data, _ := os.ReadFile(SEEN_ITEMS_FILE)
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		if line != "" {
-			seenItems[line] = true
-		}
-	}
-}
-
-func saveNewItem(productInfoID string) {
-	f, err := os.OpenFile(SEEN_ITEMS_FILE, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Printf("Error opening file for writing: %v", err)
-		return
-	}
-	defer f.Close()
-	if _, err := f.WriteString(productInfoID + "\n"); err != nil {
-		log.Printf("Error writing to file: %v", err)
-	}
-}
-
-// --- CORE API LOGIC (No changes here) ---
-func fetchAndParseAPI(apiURL string) ([]Product, error) {
-	client := &http.Client{Timeout: 15 * time.Second}
-	req, err := http.NewRequest("GET", apiURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("Referer", "https://www.firstcry.com/")
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("bad status code: %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	var outer OuterEnvelope
-	if err := json.Unmarshal(body, &outer); err != nil {
-		var altOuter map[string]interface{}
-		if err2 := json.Unmarshal(body, &altOuter); err2 == nil {
-			if respStr, ok := altOuter["ProductResponse"].(string); ok {
-				outer.ProductResponse = respStr
-			} else {
-				return nil, err
-			}
-		} else {
-			return nil, err
-		}
-	}
-	if outer.ProductResponse == "" {
-		return []Product{}, nil
-	}
-	var inner InnerData
-	if err := json.Unmarshal([]byte(outer.ProductResponse), &inner); err != nil {
-		return nil, err
-	}
-	return inner.Products, nil
-}
-
-func getAllProductsFromAPI() ([]Product, error) {
-	var allProducts []Product
-	var seenPInfIDs = make(map[string]bool) // Use PInfId to track duplicates during the scan
-
-	log.Println("... Fetching Page 1 with special API call (PageSize=100)...")
-	page1Products, err := fetchAndParseAPI(API_URL_PAGE_1)
-	if err != nil {
-		log.Printf("❌ CRITICAL: Failed to fetch Page 1, results may be incomplete: %v", err)
-	} else {
-		for _, p := range page1Products {
-			if !seenPInfIDs[p.ProductInfoID] {
-				allProducts = append(allProducts, p)
-				seenPInfIDs[p.ProductInfoID] = true
-			}
-		}
-	}
-
-	for i := 2; i <= PAGES_TO_SCAN; i++ {
-		pagingURL := fmt.Sprintf(API_URL_PAGING_TEMPLATE, i)
-		products, err := fetchAndParseAPI(pagingURL)
-		if err != nil {
-			log.Printf("❌ Error fetching API page %d: %v", i, err)
-			continue
-		}
-		if len(products) == 0 {
-			break
-		}
-		for _, p := range products {
-			if !seenPInfIDs[p.ProductInfoID] {
-				allProducts = append(allProducts, p)
-				seenPInfIDs[p.ProductInfoID] = true
-			}
-		}
-	}
-	return allProducts, nil
-}
-
-// --- CORE LOGIC (UPDATED TO USE PInfId) ---
-func initializeBaseline() {
-	log.Println("No baseline file found. Performing definitive multi-API scan...")
-	products, err := getAllProductsFromAPI()
-	if err != nil {
-		log.Printf("❌ Fatal error during baseline creation: %v", err)
-		return
-	}
-	var initialItems []string
-	for _, p := range products {
-		if p.StockStatus != "0" {
-			// Save the unique PInfId to the baseline file
-			initialItems = append(initialItems, p.ProductInfoID)
-		}
-	}
-	content := strings.Join(initialItems, "\n")
-	os.WriteFile(SEEN_ITEMS_FILE, []byte(content), 0644)
-	log.Printf("✅ Baseline created with %d IN-STOCK items.", len(initialItems))
-}
-
-func checkForNewItems() []Product {
-	log.Printf("🔎 (%s) Performing definitive multi-API check...", time.Now().Format("15:04:05"))
-	var newProductsFound []Product
-	allProducts, err := getAllProductsFromAPI()
-	if err != nil {
-		log.Printf("❌ Error getting all products: %v", err)
-		sendTelegramMessage(ADMIN_CHAT_ID, fmt.Sprintf("⚠️ Bot encountered an error: %v", err))
-		return newProductsFound
-	}
-
-	log.Printf("... Total products/variations found this check: %d", len(allProducts))
-	for _, p := range allProducts {
-		if p.StockStatus == "0" {
-			continue
-		}
-
-		// --- THE KEY FIX IS HERE ---
-		// We check our memory using the unique ProductInfoID, not the URL.
-		uniqueID := p.ProductInfoID
-
-		mutex.Lock()
-		seen := seenItems[uniqueID]
-		mutex.Unlock()
-
-		if !seen {
-			log.Printf("🚨 NEW ITEM FOUND: %s", p.ProductName)
-			newProductsFound = append(newProductsFound, p)
-
-			// We still build the user-friendly URL for the notification
-			fullURL := constructFullURL(p)
-			message := fmt.Sprintf(
-				"<b>🔥 New Hot Wheels Listing!</b>\n\n<b>Name:</b> %s\n<b>Price:</b> %s\n\n<b>Link:</b> <a href='%s'>Click Here</a>",
-				p.ProductName, p.Price, fullURL,
-			)
-			sendTelegramMessage(TELEGRAM_CHAT_ID, message)
-
-			// Save the unique ID to our memory
-			saveNewItem(uniqueID)
 			mutex.Lock()
 			seenItems[uniqueID] = true
 			mutex.Unlock()
@@ -427,6 +159,56 @@ func commandListenerWorker(stop chan struct{}) {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("--- 🔥 Hot Wheels Hunter Started (Variation-Aware API Version) 🔥 ---")
+
+	// Add HTTP server for Render deployment
+	go func() {
+		port := os.Getenv("PORT")
+		if port == "" {
+			port = "8080"
+		}
+		
+		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("🔥 Hot Wheels Hunter is running! 🔥"))
+		})
+		
+		http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+			mutex.Lock()
+			status := "running"
+			if isPaused {
+				status = "paused"
+			}
+			interval := checkInterval
+			itemCount := len(seenItems)
+			mutex.Unlock()
+			
+			response := fmt.Sprintf(`{
+				"status": "%s",
+				"check_interval_seconds": %.0f,
+				"tracked_items": %d,
+				"bot": "Hot Wheels Hunter",
+				"timestamp": "%s"
+			}`, status, interval.Seconds(), itemCount, time.Now().Format("2006-01-02 15:04:05"))
+			
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(response))
+		})
+		
+		http.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("pong"))
+		})
+		
+		log.Printf("🌐 HTTP server starting on port %s", port)
+		if err := http.ListenAndServe(":"+port, nil); err != nil {
+			log.Printf("❌ HTTP server error: %v", err)
+		}
+	}()
+	
+	// Start keep-alive service
+	startKeepAlive()
+	
 	if _, err := os.Stat(SEEN_ITEMS_FILE); os.IsNotExist(err) {
 		initializeBaseline()
 	}
