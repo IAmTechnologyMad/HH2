@@ -485,6 +485,27 @@ func commandListenerWorker(stop chan struct{}) {
 					sb.WriteString("No new products found in the last 10 checks.")
 				}
 				sendTelegramMessage(ADMIN_CHAT_ID, sb.String())
+			case "/cleanseen":
+				mutex.Lock()
+				itemCount := len(seenItems)
+				mutex.Unlock()
+				sendTelegramMessage(ADMIN_CHAT_ID, fmt.Sprintf("⚠️ About to delete %d tracked items. Send /confirmclean to proceed.", itemCount))
+			case "/confirmclean":
+				mutex.Lock()
+				seenItems = make(map[string]bool)
+				mutex.Unlock()
+				err := os.Remove(SEEN_ITEMS_FILE)
+				if err != nil {
+					sendTelegramMessage(ADMIN_CHAT_ID, fmt.Sprintf("❌ Error deleting file: %v", err))
+				} else {
+					sendTelegramMessage(ADMIN_CHAT_ID, "🗑️ Seen items cleared! Creating fresh baseline...")
+					initializeBaseline()
+					loadSeenItems()
+					mutex.Lock()
+					newCount := len(seenItems)
+					mutex.Unlock()
+					sendTelegramMessage(ADMIN_CHAT_ID, fmt.Sprintf("✅ Fresh baseline created with %d items.", newCount))
+				}
 			}
 		}
 	}
