@@ -21,7 +21,7 @@ const (
 	API_URL_PAGE_1 = "https://www.firstcry.com/svcs/SearchResult.svc/GetSearchResultProductsFilters?PageNo=1&PageSize=100&SortExpression=NewArrivals&OnSale=5&SearchString=brand&SubCatId=&BrandId=&Price=&Age=&Color=&OptionalFilter=&OutOfStock=&Type1=&Type2=&Type3=&Type4=&Type5=&Type6=&Type7=&Type8=&Type9=&Type10=&Type11=&Type12=&Type13=&Type14=&Type15=&combo=&discount=&searchwithincat=&ProductidQstr=&searchrank=&pmonths=&cgen=&PriceQstr=&DiscountQstr=&MasterBrand=113&sorting=&Rating=&Offer=&skills=&material=&curatedcollections=&measurement=&gender=&exclude=&premium=&pcode=680566&isclub=0&deliverytype="
 	// THE REGULAR API URL TEMPLATE FOR PAGES 2 AND BEYOND
 	API_URL_PAGING_TEMPLATE = "https://www.firstcry.com/svcs/SearchResult.svc/GetSearchResultProductsPaging?PageNo=%d&PageSize=20&SortExpression=NewArrivals&OnSale=5&SearchString=brand&SubCatId=&BrandId=&Price=&Age=&Color=&OptionalFilter=&OutOfStock=&Type1=&Type2=&Type3=&Type4=&Type5=&Type6=&Type7=&Type8=&Type9=&Type10=&Type11=&Type12=&Type13=&Type14=&Type15=&combo=&discount=&searchwithincat=&ProductidQstr=&searchrank=&pmonths=&cgen=&PriceQstr=&DiscountQstr=&sorting=&MasterBrand=113&Rating=&Offer=&skills=&material=&curatedcollections=&measurement=&gender=&exclude=&premium=&pcode=680566&isclub=0&deliverytype="
-	PAGES_TO_SCAN           = 6 // Total pages to check (1 initial + 9 paging)
+	PAGES_TO_SCAN           = 6 // Total pages to check (1 initial + 5 paging)
 	TELEGRAM_BOT_TOKEN      = "8222224289:AAFDgJ2C0KSTks9lLhPKtUtR1KzqraNkybI"
 	TELEGRAM_CHAT_ID        = "-4985438208"
 	ADMIN_CHAT_ID           = "837428747"
@@ -31,7 +31,7 @@ const (
 // --- SHARED STATE & DATA STRUCTS ---
 var (
 	mutex          sync.Mutex
-	checkInterval  = 30 * time.Second
+	checkInterval  = 5 * time.Second  // 🔥 OPTIMIZED TO 5 SECONDS
 	isPaused       = false
 	heartbeatMuted = false
 	seenItems      = make(map[string]bool) // The KEY will now be the ProductInfoID
@@ -55,7 +55,7 @@ type Chat struct {
 	ID int64 `json:"id"`
 }
 
-// --- API STRUCTS (UPDATED) ---
+// --- API STRUCTS ---
 type OuterEnvelope struct {
 	ProductResponse string `json:"ProductResponse"`
 }
@@ -87,7 +87,6 @@ func slugify(s string) string {
 	return s
 }
 
-// This function now uses the correct PId for the URL path
 func constructFullURL(p Product) string {
 	productSlug := slugify(p.ProductName)
 	return fmt.Sprintf("https://www.firstcry.com/hot-wheels/%s/%s/product-detail", productSlug, p.ProductID)
@@ -128,22 +127,19 @@ func saveNewItem(productInfoID string) {
 }
 
 func startKeepAlive() {
-	// Your specific Render URL
 	appURL := "https://hh2-uaol.onrender.com"
 	
 	go func() {
-		// Wait 2 minutes before starting keep-alive (let the app fully start)
 		log.Println("⏰ Keep-alive will start in 2 minutes...")
 		time.Sleep(2 * time.Minute)
 		
-		ticker := time.NewTicker(8 * time.Minute) // Ping every 8 minutes
+		ticker := time.NewTicker(8 * time.Minute)
 		defer ticker.Stop()
 		
 		log.Printf("🔄 Keep-alive service started, pinging: %s", appURL)
 		
 		client := &http.Client{Timeout: 30 * time.Second}
 		
-		// Do an immediate first ping
 		resp, err := client.Get(appURL + "/ping")
 		if err != nil {
 			log.Printf("⚠️ Initial keep-alive ping failed: %v", err)
@@ -167,7 +163,7 @@ func startKeepAlive() {
 	}()
 }
 
-// --- CORE API LOGIC (No changes here) ---
+// --- CORE API LOGIC (OPTIMIZED WITH PARALLEL FETCHING) ---
 func fetchAndParseAPI(apiURL string) ([]Product, error) {
 	client := &http.Client{Timeout: 15 * time.Second}
 	req, err := http.NewRequest("GET", apiURL, nil)
@@ -212,44 +208,79 @@ func fetchAndParseAPI(apiURL string) ([]Product, error) {
 	return inner.Products, nil
 }
 
+// 🚀 OPTIMIZED: PARALLEL API FETCHING
 func getAllProductsFromAPI() ([]Product, error) {
 	var allProducts []Product
-	var seenPInfIDs = make(map[string]bool) // Use PInfId to track duplicates during the scan
-
-	log.Println("... Fetching Page 1 with special API call (PageSize=100)...")
-	page1Products, err := fetchAndParseAPI(API_URL_PAGE_1)
-	if err != nil {
-		log.Printf("❌ CRITICAL: Failed to fetch Page 1, results may be incomplete: %v", err)
-	} else {
-		for _, p := range page1Products {
-			if !seenPInfIDs[p.ProductInfoID] {
-				allProducts = append(allProducts, p)
-				seenPInfIDs[p.ProductInfoID] = true
+	var seenPInfIDs = make(map[string]bool)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	
+	productsChan := make(chan []Product, PAGES_TO_SCAN)
+	errorsChan := make(chan error, PAGES_TO_SCAN)
+	
+	// Fetch Page 1 in parallel
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		products, err := fetchAndParseAPI(API_URL_PAGE_1)
+		if err != nil {
+			errorsChan <- fmt.Errorf("page 1: %w", err)
+			return
+		}
+		productsChan <- products
+	}()
+	
+	// Fetch Pages 2-6 in parallel
+	for i := 2; i <= PAGES_TO_SCAN; i++ {
+		wg.Add(1)
+		pageNum := i
+		go func() {
+			defer wg.Done()
+			pagingURL := fmt.Sprintf(API_URL_PAGING_TEMPLATE, pageNum)
+			products, err := fetchAndParseAPI(pagingURL)
+			if err != nil {
+				errorsChan <- fmt.Errorf("page %d: %w", pageNum, err)
+				return
+			}
+			productsChan <- products
+		}()
+	}
+	
+	// Close channels after all goroutines complete
+	go func() {
+		wg.Wait()
+		close(productsChan)
+		close(errorsChan)
+	}()
+	
+	// Collect errors (log but don't fail completely)
+	var criticalError error
+	go func() {
+		for err := range errorsChan {
+			log.Printf("❌ API fetch error: %v", err)
+			if criticalError == nil {
+				criticalError = err
 			}
 		}
-	}
-
-	for i := 2; i <= PAGES_TO_SCAN; i++ {
-		pagingURL := fmt.Sprintf(API_URL_PAGING_TEMPLATE, i)
-		products, err := fetchAndParseAPI(pagingURL)
-		if err != nil {
-			log.Printf("❌ Error fetching API page %d: %v", i, err)
-			continue
-		}
-		if len(products) == 0 {
-			break
-		}
+	}()
+	
+	// Collect all products and deduplicate
+	for products := range productsChan {
+		mu.Lock()
 		for _, p := range products {
 			if !seenPInfIDs[p.ProductInfoID] {
 				allProducts = append(allProducts, p)
 				seenPInfIDs[p.ProductInfoID] = true
 			}
 		}
+		mu.Unlock()
 	}
-	return allProducts, nil
+	
+	log.Printf("✅ Parallel fetch complete: %d unique products found", len(allProducts))
+	return allProducts, criticalError
 }
 
-// --- CORE LOGIC (UPDATED TO USE PInfId) ---
+// --- CORE LOGIC ---
 func initializeBaseline() {
 	log.Println("No baseline file found. Performing definitive multi-API scan...")
 	products, err := getAllProductsFromAPI()
@@ -260,7 +291,6 @@ func initializeBaseline() {
 	var initialItems []string
 	for _, p := range products {
 		if p.StockStatus != "0" {
-			// Save the unique PInfId to the baseline file
 			initialItems = append(initialItems, p.ProductInfoID)
 		}
 	}
@@ -285,8 +315,6 @@ func checkForNewItems() []Product {
 			continue
 		}
 
-		// --- THE KEY FIX IS HERE ---
-		// We check our memory using the unique ProductInfoID, not the URL.
 		uniqueID := p.ProductInfoID
 
 		mutex.Lock()
@@ -297,7 +325,6 @@ func checkForNewItems() []Product {
 			log.Printf("🚨 NEW ITEM FOUND: %s", p.ProductName)
 			newProductsFound = append(newProductsFound, p)
 
-			// We still build the user-friendly URL for the notification
 			fullURL := constructFullURL(p)
 			message := fmt.Sprintf(
 				"<b>🔥 New Hot Wheels Listing!</b>\n\n<b>Name:</b> %s\n<b>Price:</b> %s\n\n<b>Link:</b> <a href='%s'>Click Here</a>",
@@ -305,7 +332,6 @@ func checkForNewItems() []Product {
 			)
 			sendTelegramMessage(TELEGRAM_CHAT_ID, message)
 
-			// Save the unique ID to our memory
 			saveNewItem(uniqueID)
 			mutex.Lock()
 			seenItems[uniqueID] = true
@@ -412,13 +438,13 @@ func commandListenerWorker(stop chan struct{}) {
 			case "/setinterval":
 				if len(parts) > 1 {
 					i, err := strconv.Atoi(parts[1])
-					if err == nil && i >= 10 {
+					if err == nil && i >= 5 {
 						mutex.Lock()
 						checkInterval = time.Duration(i) * time.Second
 						mutex.Unlock()
 						sendTelegramMessage(ADMIN_CHAT_ID, fmt.Sprintf("✅ Interval set to %d seconds.", i))
 					} else {
-						sendTelegramMessage(ADMIN_CHAT_ID, "❌ Invalid interval.")
+						sendTelegramMessage(ADMIN_CHAT_ID, "❌ Invalid interval (minimum 5 seconds).")
 					}
 				} else {
 					sendTelegramMessage(ADMIN_CHAT_ID, "Usage: /setinterval <seconds>")
@@ -466,7 +492,7 @@ func commandListenerWorker(stop chan struct{}) {
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.Println("--- 🔥 Hot Wheels Hunter Started (Variation-Aware API Version) 🔥 ---")
+	log.Println("--- 🔥 Hot Wheels Hunter Started (5-Second Parallel Version) 🔥 ---")
 
 	// Add HTTP server for Render deployment
 	go func() {
@@ -477,7 +503,7 @@ func main() {
 		
 		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("🔥 Hot Wheels Hunter is running! 🔥"))
+			w.Write([]byte("🔥 Hot Wheels Hunter is running! (5-second intervals) 🔥"))
 		})
 		
 		http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
@@ -494,7 +520,7 @@ func main() {
 				"status": "%s",
 				"check_interval_seconds": %.0f,
 				"tracked_items": %d,
-				"bot": "Hot Wheels Hunter",
+				"bot": "Hot Wheels Hunter (Optimized)",
 				"timestamp": "%s"
 			}`, status, interval.Seconds(), itemCount, time.Now().Format("2006-01-02 15:04:05"))
 			
@@ -525,8 +551,7 @@ func main() {
 	stop := make(chan struct{})
 	go scraperWorker(stop)
 	go commandListenerWorker(stop)
-	sendTelegramMessage(ADMIN_CHAT_ID, "🚀 Bot is online and running!")
+	sendTelegramMessage(ADMIN_CHAT_ID, "🚀 Bot is online and running! (5-second intervals)")
 	<-stop
 	log.Println("--- Bot has been shut down. ---")
 }
-
