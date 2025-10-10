@@ -17,28 +17,24 @@ import (
 
 // --- CONFIGURATION ---
 const (
-	// THE SPECIAL API URL FOR PAGE 1
 	API_URL_PAGE_1 = "https://www.firstcry.com/svcs/SearchResult.svc/GetSearchResultProductsFilters?PageNo=1&PageSize=100&SortExpression=NewArrivals&OnSale=5&SearchString=brand&SubCatId=&BrandId=&Price=&Age=&Color=&OptionalFilter=&OutOfStock=&Type1=&Type2=&Type3=&Type4=&Type5=&Type6=&Type7=&Type8=&Type9=&Type10=&Type11=&Type12=&Type13=&Type14=&Type15=&combo=&discount=&searchwithincat=&ProductidQstr=&searchrank=&pmonths=&cgen=&PriceQstr=&DiscountQstr=&MasterBrand=113&sorting=&Rating=&Offer=&skills=&material=&curatedcollections=&measurement=&gender=&exclude=&premium=&pcode=680566&isclub=0&deliverytype="
-	// THE REGULAR API URL TEMPLATE FOR PAGES 2 AND BEYOND
 	API_URL_PAGING_TEMPLATE = "https://www.firstcry.com/svcs/SearchResult.svc/GetSearchResultProductsPaging?PageNo=%d&PageSize=20&SortExpression=NewArrivals&OnSale=5&SearchString=brand&SubCatId=&BrandId=&Price=&Age=&Color=&OptionalFilter=&OutOfStock=&Type1=&Type2=&Type3=&Type4=&Type5=&Type6=&Type7=&Type8=&Type9=&Type10=&Type11=&Type12=&Type13=&Type14=&Type15=&combo=&discount=&searchwithincat=&ProductidQstr=&searchrank=&pmonths=&cgen=&PriceQstr=&DiscountQstr=&sorting=&MasterBrand=113&Rating=&Offer=&skills=&material=&curatedcollections=&measurement=&gender=&exclude=&premium=&pcode=680566&isclub=0&deliverytype="
-	PAGES_TO_SCAN           = 6 // Total pages to check (1 initial + 5 paging)
+	PAGES_TO_SCAN           = 6
 	TELEGRAM_BOT_TOKEN      = "8222224289:AAFDgJ2C0KSTks9lLhPKtUtR1KzqraNkybI"
 	TELEGRAM_CHAT_ID        = "-4985438208"
 	ADMIN_CHAT_ID           = "837428747"
 	SEEN_ITEMS_FILE         = "seen_hotwheels_go.txt"
 )
 
-// --- SHARED STATE & DATA STRUCTS ---
 var (
 	mutex          sync.Mutex
-	checkInterval  = 5 * time.Second  // 🔥 OPTIMIZED TO 5 SECONDS
+	checkInterval  = 5 * time.Second
 	isPaused       = false
 	heartbeatMuted = false
-	seenItems      = make(map[string]bool) // The KEY will now be the ProductInfoID
+	seenItems      = make(map[string]bool)
 	checkHistory   []CheckResult
 )
 
-// --- TELEGRAM STRUCTS ---
 type TelegramUpdateResponse struct {
 	Ok     bool     `json:"ok"`
 	Result []Update `json:"result"`
@@ -55,7 +51,6 @@ type Chat struct {
 	ID int64 `json:"id"`
 }
 
-// --- API STRUCTS ---
 type OuterEnvelope struct {
 	ProductResponse string `json:"ProductResponse"`
 }
@@ -64,19 +59,17 @@ type InnerData struct {
 }
 type Product struct {
 	ProductID     string `json:"PId"`
-	ProductInfoID string `json:"PInfId"` // THE TRUE UNIQUE ID
+	ProductInfoID string `json:"PInfId"`
 	ProductName   string `json:"PNm"`
 	Price         string `json:"discprice"`
 	StockStatus   string `json:"CrntStock"`
 }
 
-// --- HISTORY STRUCT ---
 type CheckResult struct {
 	Timestamp     time.Time
 	FoundProducts []Product
 }
 
-// --- HELPER FUNCTIONS ---
 var nonAlphanumericRegex = regexp.MustCompile(`[^a-zA-Z0-9 ]+`)
 var spaceRegex = regexp.MustCompile(`\s+`)
 
@@ -126,51 +119,13 @@ func saveNewItem(productInfoID string) {
 	}
 }
 
-func startKeepAlive() {
-	appURL := "https://hh2-uaol.onrender.com"
-	
-	go func() {
-		log.Println("⏰ Keep-alive will start in 2 minutes...")
-		time.Sleep(2 * time.Minute)
-		
-		ticker := time.NewTicker(8 * time.Minute)
-		defer ticker.Stop()
-		
-		log.Printf("🔄 Keep-alive service started, pinging: %s", appURL)
-		
-		client := &http.Client{Timeout: 30 * time.Second}
-		
-		resp, err := client.Get(appURL + "/ping")
-		if err != nil {
-			log.Printf("⚠️ Initial keep-alive ping failed: %v", err)
-		} else {
-			resp.Body.Close()
-			log.Printf("✅ Initial keep-alive ping successful (status: %d)", resp.StatusCode)
-		}
-		
-		for {
-			select {
-			case <-ticker.C:
-				resp, err := client.Get(appURL + "/ping")
-				if err != nil {
-					log.Printf("⚠️ Keep-alive ping failed: %v", err)
-				} else {
-					resp.Body.Close()
-					log.Printf("✅ Keep-alive ping successful (status: %d)", resp.StatusCode)
-				}
-			}
-		}
-	}()
-}
-
-// --- CORE API LOGIC (OPTIMIZED WITH PARALLEL FETCHING) ---
 func fetchAndParseAPI(apiURL string) ([]Product, error) {
 	client := &http.Client{Timeout: 15 * time.Second}
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Referer", "https://www.firstcry.com/")
 	resp, err := client.Do(req)
@@ -208,7 +163,6 @@ func fetchAndParseAPI(apiURL string) ([]Product, error) {
 	return inner.Products, nil
 }
 
-// 🚀 OPTIMIZED: PARALLEL API FETCHING
 func getAllProductsFromAPI() ([]Product, error) {
 	var allProducts []Product
 	var seenPInfIDs = make(map[string]bool)
@@ -218,7 +172,6 @@ func getAllProductsFromAPI() ([]Product, error) {
 	productsChan := make(chan []Product, PAGES_TO_SCAN)
 	errorsChan := make(chan error, PAGES_TO_SCAN)
 	
-	// Fetch Page 1 in parallel
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -230,7 +183,6 @@ func getAllProductsFromAPI() ([]Product, error) {
 		productsChan <- products
 	}()
 	
-	// Fetch Pages 2-6 in parallel
 	for i := 2; i <= PAGES_TO_SCAN; i++ {
 		wg.Add(1)
 		pageNum := i
@@ -246,14 +198,12 @@ func getAllProductsFromAPI() ([]Product, error) {
 		}()
 	}
 	
-	// Close channels after all goroutines complete
 	go func() {
 		wg.Wait()
 		close(productsChan)
 		close(errorsChan)
 	}()
 	
-	// Collect errors (log but don't fail completely)
 	var criticalError error
 	go func() {
 		for err := range errorsChan {
@@ -264,7 +214,6 @@ func getAllProductsFromAPI() ([]Product, error) {
 		}
 	}()
 	
-	// Collect all products and deduplicate
 	for products := range productsChan {
 		mu.Lock()
 		for _, p := range products {
@@ -280,7 +229,6 @@ func getAllProductsFromAPI() ([]Product, error) {
 	return allProducts, criticalError
 }
 
-// --- CORE LOGIC ---
 func initializeBaseline() {
 	log.Println("No baseline file found. Performing definitive multi-API scan...")
 	products, err := getAllProductsFromAPI()
@@ -513,9 +461,9 @@ func commandListenerWorker(stop chan struct{}) {
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.Println("--- 🔥 Hot Wheels Hunter Started (5-Second Parallel Version) 🔥 ---")
+	log.Println("--- 🔥 Hot Wheels Hunter Started (Railway Optimized) 🔥 ---")
 
-	// Add HTTP server for Render deployment
+	// Simple HTTP server for health checks (Railway doesn't need keep-alive)
 	go func() {
 		port := os.Getenv("PORT")
 		if port == "" {
@@ -524,7 +472,7 @@ func main() {
 		
 		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("🔥 Hot Wheels Hunter is running! (5-second intervals) 🔥"))
+			w.Write([]byte("🔥 Hot Wheels Hunter is running on Railway! 🔥"))
 		})
 		
 		http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
@@ -541,7 +489,7 @@ func main() {
 				"status": "%s",
 				"check_interval_seconds": %.0f,
 				"tracked_items": %d,
-				"bot": "Hot Wheels Hunter (Optimized)",
+				"platform": "Railway",
 				"timestamp": "%s"
 			}`, status, interval.Seconds(), itemCount, time.Now().Format("2006-01-02 15:04:05"))
 			
@@ -550,9 +498,9 @@ func main() {
 			w.Write([]byte(response))
 		})
 		
-		http.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+		http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("pong"))
+			w.Write([]byte("healthy"))
 		})
 		
 		log.Printf("🌐 HTTP server starting on port %s", port)
@@ -560,9 +508,6 @@ func main() {
 			log.Printf("❌ HTTP server error: %v", err)
 		}
 	}()
-	
-	// Start keep-alive service
-	startKeepAlive()
 	
 	if _, err := os.Stat(SEEN_ITEMS_FILE); os.IsNotExist(err) {
 		initializeBaseline()
@@ -572,7 +517,7 @@ func main() {
 	stop := make(chan struct{})
 	go scraperWorker(stop)
 	go commandListenerWorker(stop)
-	sendTelegramMessage(ADMIN_CHAT_ID, "🚀 Bot is online and running! (5-second intervals)")
+	sendTelegramMessage(ADMIN_CHAT_ID, "🚀 Bot is online and running on Railway! (5-second intervals)")
 	<-stop
 	log.Println("--- Bot has been shut down. ---")
 }
