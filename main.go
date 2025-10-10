@@ -17,13 +17,11 @@ import (
 
 // --- CONFIGURATION ---
 const (
-	API_URL_PAGE_1 = "https://www.firstcry.com/svcs/SearchResult.svc/GetSearchResultProductsFilters?PageNo=1&PageSize=100&SortExpression=NewArrivals&OnSale=5&SearchString=brand&SubCatId=&BrandId=&Price=&Age=&Color=&OptionalFilter=&OutOfStock=&Type1=&Type2=&Type3=&Type4=&Type5=&Type6=&Type7=&Type8=&Type9=&Type10=&Type11=&Type12=&Type13=&Type14=&Type15=&combo=&discount=&searchwithincat=&ProductidQstr=&searchrank=&pmonths=&cgen=&PriceQstr=&DiscountQstr=&MasterBrand=113&sorting=&Rating=&Offer=&skills=&material=&curatedcollections=&measurement=&gender=&exclude=&premium=&pcode=680566&isclub=0&deliverytype="
-	API_URL_PAGING_TEMPLATE = "https://www.firstcry.com/svcs/SearchResult.svc/GetSearchResultProductsPaging?PageNo=%d&PageSize=20&SortExpression=NewArrivals&OnSale=5&SearchString=brand&SubCatId=&BrandId=&Price=&Age=&Color=&OptionalFilter=&OutOfStock=&Type1=&Type2=&Type3=&Type4=&Type5=&Type6=&Type7=&Type8=&Type9=&Type10=&Type11=&Type12=&Type13=&Type14=&Type15=&combo=&discount=&searchwithincat=&ProductidQstr=&searchrank=&pmonths=&cgen=&PriceQstr=&DiscountQstr=&sorting=&MasterBrand=113&Rating=&Offer=&skills=&material=&curatedcollections=&measurement=&gender=&exclude=&premium=&pcode=680566&isclub=0&deliverytype="
-	PAGES_TO_SCAN           = 6
-	TELEGRAM_BOT_TOKEN      = "8222224289:AAFDgJ2C0KSTks9lLhPKtUtR1KzqraNkybI"
-	TELEGRAM_CHAT_ID        = "-4985438208"
-	ADMIN_CHAT_ID           = "837428747"
-	SEEN_ITEMS_FILE         = "seen_hotwheels_go.txt"
+	API_URL              = "https://www.firstcry.com/svcs/SearchResult.svc/GetSearchResultProductsFilters?PageNo=1&PageSize=100&SortExpression=NewArrivals&OnSale=5&SearchString=brand&SubCatId=&BrandId=&Price=&Age=&Color=&OptionalFilter=&OutOfStock=&Type1=&Type2=&Type3=&Type4=&Type5=&Type6=&Type7=&Type8=&Type9=&Type10=&Type11=&Type12=&Type13=&Type14=&Type15=&combo=&discount=&searchwithincat=&ProductidQstr=&searchrank=&pmonths=&cgen=&PriceQstr=&DiscountQstr=&MasterBrand=113&sorting=&Rating=&Offer=&skills=&material=&curatedcollections=&measurement=&gender=&exclude=&premium=&pcode=680566&isclub=0&deliverytype="
+	TELEGRAM_BOT_TOKEN   = "8222224289:AAFDgJ2C0KSTks9lLhPKtUtR1KzqraNkybI"
+	TELEGRAM_CHAT_ID     = "-4985438208"
+	ADMIN_CHAT_ID        = "837428747"
+	SEEN_ITEMS_FILE      = "seen_hotwheels_go.txt"
 )
 
 var (
@@ -119,27 +117,31 @@ func saveNewItem(productInfoID string) {
 	}
 }
 
-func fetchAndParseAPI(apiURL string) ([]Product, error) {
+func fetchAndParseAPI() ([]Product, error) {
 	client := &http.Client{Timeout: 15 * time.Second}
-	req, err := http.NewRequest("GET", apiURL, nil)
+	req, err := http.NewRequest("GET", API_URL, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Referer", "https://www.firstcry.com/")
+	
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("bad status code: %d", resp.StatusCode)
 	}
+	
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
+	
 	var outer OuterEnvelope
 	if err := json.Unmarshal(body, &outer); err != nil {
 		var altOuter map[string]interface{}
@@ -153,111 +155,52 @@ func fetchAndParseAPI(apiURL string) ([]Product, error) {
 			return nil, err
 		}
 	}
+	
 	if outer.ProductResponse == "" {
 		return []Product{}, nil
 	}
+	
 	var inner InnerData
 	if err := json.Unmarshal([]byte(outer.ProductResponse), &inner); err != nil {
 		return nil, err
 	}
+	
 	return inner.Products, nil
 }
 
-func getAllProductsFromAPI() ([]Product, error) {
-	var allProducts []Product
-	var seenPInfIDs = make(map[string]bool)
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	
-	productsChan := make(chan []Product, PAGES_TO_SCAN)
-	errorsChan := make(chan error, PAGES_TO_SCAN)
-	
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		products, err := fetchAndParseAPI(API_URL_PAGE_1)
-		if err != nil {
-			errorsChan <- fmt.Errorf("page 1: %w", err)
-			return
-		}
-		productsChan <- products
-	}()
-	
-	for i := 2; i <= PAGES_TO_SCAN; i++ {
-		wg.Add(1)
-		pageNum := i
-		go func() {
-			defer wg.Done()
-			pagingURL := fmt.Sprintf(API_URL_PAGING_TEMPLATE, pageNum)
-			products, err := fetchAndParseAPI(pagingURL)
-			if err != nil {
-				errorsChan <- fmt.Errorf("page %d: %w", pageNum, err)
-				return
-			}
-			productsChan <- products
-		}()
-	}
-	
-	go func() {
-		wg.Wait()
-		close(productsChan)
-		close(errorsChan)
-	}()
-	
-	var criticalError error
-	go func() {
-		for err := range errorsChan {
-			log.Printf("❌ API fetch error: %v", err)
-			if criticalError == nil {
-				criticalError = err
-			}
-		}
-	}()
-	
-	for products := range productsChan {
-		mu.Lock()
-		for _, p := range products {
-			if !seenPInfIDs[p.ProductInfoID] {
-				allProducts = append(allProducts, p)
-				seenPInfIDs[p.ProductInfoID] = true
-			}
-		}
-		mu.Unlock()
-	}
-	
-	log.Printf("✅ Parallel fetch complete: %d unique products found", len(allProducts))
-	return allProducts, criticalError
-}
-
 func initializeBaseline() {
-	log.Println("No baseline file found. Performing definitive multi-API scan...")
-	products, err := getAllProductsFromAPI()
+	log.Println("No baseline file found. Creating baseline from page 1...")
+	products, err := fetchAndParseAPI()
 	if err != nil {
 		log.Printf("❌ Fatal error during baseline creation: %v", err)
 		return
 	}
+	
 	var initialItems []string
 	for _, p := range products {
 		if p.StockStatus != "0" {
 			initialItems = append(initialItems, p.ProductInfoID)
 		}
 	}
+	
 	content := strings.Join(initialItems, "\n")
 	os.WriteFile(SEEN_ITEMS_FILE, []byte(content), 0644)
-	log.Printf("✅ Baseline created with %d IN-STOCK items.", len(initialItems))
+	log.Printf("✅ Baseline created with %d IN-STOCK items from page 1.", len(initialItems))
 }
 
 func checkForNewItems() []Product {
-	log.Printf("🔎 (%s) Performing definitive multi-API check...", time.Now().Format("15:04:05"))
+	log.Printf("🔎 (%s) Checking page 1 for new items...", time.Now().Format("15:04:05"))
 	var newProductsFound []Product
-	allProducts, err := getAllProductsFromAPI()
+	
+	allProducts, err := fetchAndParseAPI()
 	if err != nil {
-		log.Printf("❌ Error getting all products: %v", err)
+		log.Printf("❌ Error fetching products: %v", err)
 		sendTelegramMessage(ADMIN_CHAT_ID, fmt.Sprintf("⚠️ Bot encountered an error: %v", err))
 		return newProductsFound
 	}
 
-	log.Printf("... Total products/variations found this check: %d", len(allProducts))
+	log.Printf("... Total products found: %d", len(allProducts))
+	
 	for _, p := range allProducts {
 		if p.StockStatus == "0" {
 			continue
@@ -294,15 +237,18 @@ func scraperWorker(stop chan struct{}) {
 	mutex.Lock()
 	checkHistory = append(checkHistory, CheckResult{Timestamp: time.Now(), FoundProducts: initialFinds})
 	mutex.Unlock()
+	
 	if len(initialFinds) == 0 {
 		log.Println("...No new items found.")
 		sendTelegramMessage(TELEGRAM_CHAT_ID, "✅ No new listings found on initial check.")
 	}
+	
 	for {
 		mutex.Lock()
 		interval := checkInterval
 		paused := isPaused
 		mutex.Unlock()
+		
 		select {
 		case <-time.After(interval):
 			if !paused {
@@ -315,6 +261,7 @@ func scraperWorker(stop chan struct{}) {
 				isMuted := heartbeatMuted
 				currentInterval := checkInterval
 				mutex.Unlock()
+				
 				if len(newlyFoundProducts) == 0 {
 					log.Println("...No new items found.")
 					if !isMuted {
@@ -334,6 +281,7 @@ func scraperWorker(stop chan struct{}) {
 func commandListenerWorker(stop chan struct{}) {
 	log.Println("🤖 Command listener started.")
 	var lastUpdateID int
+	
 	for {
 		apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=10", TELEGRAM_BOT_TOKEN, lastUpdateID+1)
 		resp, err := http.Get(apiURL)
@@ -343,46 +291,56 @@ func commandListenerWorker(stop chan struct{}) {
 			continue
 		}
 		defer resp.Body.Close()
+		
 		body, _ := io.ReadAll(resp.Body)
 		var updates TelegramUpdateResponse
 		json.Unmarshal(body, &updates)
+		
 		for _, update := range updates.Result {
 			lastUpdateID = update.UpdateID
 			if update.Message.Text == "" || update.Message.Chat.ID == 0 {
 				continue
 			}
+			
 			chatIDStr := strconv.FormatInt(update.Message.Chat.ID, 10)
 			if chatIDStr != ADMIN_CHAT_ID {
 				sendTelegramMessage(chatIDStr, "Sorry, you are not authorized.")
 				continue
 			}
+			
 			parts := strings.Fields(update.Message.Text)
 			command := parts[0]
+			
 			switch command {
 			case "/start":
 				mutex.Lock()
 				isPaused = false
 				mutex.Unlock()
 				sendTelegramMessage(ADMIN_CHAT_ID, "▶️ Bot resumed.")
+				
 			case "/pause":
 				mutex.Lock()
 				isPaused = true
 				mutex.Unlock()
 				sendTelegramMessage(ADMIN_CHAT_ID, "⏸️ Bot paused.")
+				
 			case "/stop":
 				sendTelegramMessage(ADMIN_CHAT_ID, "🛑 Stopping bot...")
 				close(stop)
 				return
+				
 			case "/mute":
 				mutex.Lock()
 				heartbeatMuted = true
 				mutex.Unlock()
 				sendTelegramMessage(ADMIN_CHAT_ID, "🔕 Heartbeat notifications muted.")
+				
 			case "/unmute":
 				mutex.Lock()
 				heartbeatMuted = false
 				mutex.Unlock()
 				sendTelegramMessage(ADMIN_CHAT_ID, "🔔 Heartbeat notifications enabled.")
+				
 			case "/setinterval":
 				if len(parts) > 1 {
 					i, err := strconv.Atoi(parts[1])
@@ -397,6 +355,7 @@ func commandListenerWorker(stop chan struct{}) {
 				} else {
 					sendTelegramMessage(ADMIN_CHAT_ID, "Usage: /setinterval <seconds>")
 				}
+				
 			case "/status":
 				mutex.Lock()
 				status := "▶️ Running"
@@ -409,7 +368,8 @@ func commandListenerWorker(stop chan struct{}) {
 				}
 				interval := checkInterval
 				mutex.Unlock()
-				sendTelegramMessage(ADMIN_CHAT_ID, fmt.Sprintf("<b>Bot Status:</b>\n%s\nCheck Interval: %.0f seconds\nHeartbeat: %s", status, interval.Seconds(), hbStatus))
+				sendTelegramMessage(ADMIN_CHAT_ID, fmt.Sprintf("<b>Bot Status:</b>\n%s\nCheck Interval: %.0f seconds\nHeartbeat: %s\nMode: Single Page (Fast)", status, interval.Seconds(), hbStatus))
+				
 			case "/recent":
 				var sb strings.Builder
 				sb.WriteString("<b>🔎 Recent Finds (Last 10 Checks)</b>\n\n")
@@ -433,11 +393,13 @@ func commandListenerWorker(stop chan struct{}) {
 					sb.WriteString("No new products found in the last 10 checks.")
 				}
 				sendTelegramMessage(ADMIN_CHAT_ID, sb.String())
+				
 			case "/cleanseen":
 				mutex.Lock()
 				itemCount := len(seenItems)
 				mutex.Unlock()
 				sendTelegramMessage(ADMIN_CHAT_ID, fmt.Sprintf("⚠️ About to delete %d tracked items. Send /confirmclean to proceed.", itemCount))
+				
 			case "/confirmclean":
 				mutex.Lock()
 				seenItems = make(map[string]bool)
@@ -461,9 +423,8 @@ func commandListenerWorker(stop chan struct{}) {
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.Println("--- 🔥 Hot Wheels Hunter Started (Railway Optimized) 🔥 ---")
+	log.Println("--- 🔥 Hot Wheels Hunter Started (Single Page - Optimized) 🔥 ---")
 
-	// Simple HTTP server for health checks (Railway doesn't need keep-alive)
 	go func() {
 		port := os.Getenv("PORT")
 		if port == "" {
@@ -472,7 +433,7 @@ func main() {
 		
 		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("🔥 Hot Wheels Hunter is running on Railway! 🔥"))
+			w.Write([]byte("🔥 Hot Wheels Hunter is running (Single Page Mode)! 🔥"))
 		})
 		
 		http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
@@ -489,6 +450,7 @@ func main() {
 				"status": "%s",
 				"check_interval_seconds": %.0f,
 				"tracked_items": %d,
+				"mode": "single_page_optimized",
 				"platform": "Railway",
 				"timestamp": "%s"
 			}`, status, interval.Seconds(), itemCount, time.Now().Format("2006-01-02 15:04:05"))
@@ -514,10 +476,12 @@ func main() {
 	}
 	loadSeenItems()
 	log.Printf("✅ Loaded existing baseline with %d items.", len(seenItems))
+	
 	stop := make(chan struct{})
 	go scraperWorker(stop)
 	go commandListenerWorker(stop)
-	sendTelegramMessage(ADMIN_CHAT_ID, "🚀 Bot is online and running on Railway! (5-second intervals)")
+	sendTelegramMessage(ADMIN_CHAT_ID, "🚀 Bot is online (Single Page Mode - Fast & Efficient)!")
+	
 	<-stop
 	log.Println("--- Bot has been shut down. ---")
 }
