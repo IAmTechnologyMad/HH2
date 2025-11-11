@@ -180,7 +180,7 @@ func saveNewItem(productInfoID string) {
 
 func startKeepAlive() {
 	// Your specific Render URL
-	appURL := "https://hh-mvnn.onrender.com"
+	appURL := "https://hh2-uaol.onrender.com"
 	go func() {
 		// Wait 2 minutes before starting keep-alive (let the app fully start)
 		log.Println("⏰ Keep-alive will start in 2 minutes...")
@@ -625,3 +625,4 @@ func main() {
 	writerWg.Wait()
 	log.Println("--- Bot has been shut down. ---")
 }
+
