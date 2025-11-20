@@ -1,12 +1,12 @@
+// hotwheels_bot_render.go
 package main
 
 import (
-	"bufio"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,42 +17,37 @@ import (
 	"time"
 )
 
-// --- CONFIGURATION ---
+// -----------------------
+// CONFIGURATION
+// -----------------------
 const (
-	// ONLY CHECK PAGE 1 - Where all new listings appear
-	API_URL_PAGE_1 = "https://www.firstcry.com/svcs/SearchResult.svc/GetSearchResultProductsFilters?PageNo=1&PageSize=100&SortExpression=NewArrivals&OnSale=5&SearchString=brand&SubCatId=&BrandId=&Price=&Age=&Color=&OptionalFilter=&OutOfStock=&Type1=&Type2=&Type3=&Type4=&Type5=&Type6=&Type7=&Type8=&Type9=&Type10=&Type11=&Type12=&Type13=&Type14=&Type15=&combo=&discount=&searchwithincat=&ProductidQstr=&searchrank=&pmonths=&cgen=&PriceQstr=&DiscountQstr=&MasterBrand=113&sorting=&Rating=&Offer=&skills=&material=&curatedcollections=&measurement=&gender=&exclude=&premium=&pcode=680566&isclub=0&deliverytype="
-	
+	API_URL_PAGE_1         = "https://www.firstcry.com/svcs/SearchResult.svc/GetSearchResultProductsFilters?PageNo=1&PageSize=100&SortExpression=NewArrivals&OnSale=5&SearchString=brand&SubCatId=&BrandId=&Price=&Age=&Color=&OptionalFilter=&OutOfStock=&Type1=&Type2=&Type3=&Type4=&Type5=&Type6=&Type7=&Type8=&Type9=&Type10=&Type11=&Type12=&Type13=&Type14=&Type15=&combo=&discount=&searchwithincat=&ProductidQstr=&searchrank=&pmonths=&cgen=&PriceQstr=&DiscountQstr=&MasterBrand=113&sorting=&Rating=&Offer=&skills=&material=&curatedcollections=&measurement=&gender=&exclude=&premium=&pcode=680566&isclub=0&deliverytype="
+	API_URL_PAGING_TEMPLATE = "https://www.firstcry.com/svcs/SearchResult.svc/GetSearchResultProductsPaging?PageNo=%d&PageSize=20&SortExpression=NewArrivals&OnSale=5&SearchString=brand&SubCatId=&BrandId=&Price=&Age=&Color=&OptionalFilter=&OutOfStock=&Type1=&Type2=&Type3=&Type4=&Type5=&Type6=&Type7=&Type8=&Type9=&Type10=&Type11=&Type12=&Type13=&Type14=&Type15=&combo=&discount=&searchwithincat=&ProductidQstr=&searchrank=&pmonths=&cgen=&PriceQstr=&DiscountQstr=&sorting=&MasterBrand=113&Rating=&Offer=&skills=&material=&curatedcollections=&measurement=&gender=&exclude=&premium=&pcode=680566&isclub=0&deliverytype="
+	PAGES_TO_SCAN          = 6
+	SEEN_ITEMS_FILE        = "seen_hotwheels_go.txt"
+
+	// Your existing Telegram settings (kept)
 	TELEGRAM_BOT_TOKEN = "8222224289:AAFDgJ2C0KSTks9lLhPKtUtR1KzqraNkybI"
 	TELEGRAM_CHAT_ID   = "-4985438208"
 	ADMIN_CHAT_ID      = "837428747"
-	SEEN_ITEMS_FILE    = "seen_hotwheels_go.txt"
 )
 
-// --- SHARED STATE & DATA STRUCTS ---
+// -----------------------
+// SHARED STATE & STRUCTS
+// -----------------------
 var (
+	// concurrency-safe seen items using a plain map + mutex (fast enough, simple)
+	seenItems   = make(map[string]bool) // key: ProductInfoID
+	seenItemsMu sync.RWMutex
+
 	mutex          sync.Mutex
-	checkInterval  = 5 * time.Second // FAST 5 SECOND CHECKS
+	checkInterval  = 5 * time.Second // default 5s (user requested fast checks)
 	isPaused       = false
-	heartbeatMuted = true // Muted by default for fast checks
-	seenItems      = make(map[string]bool)
+	heartbeatMuted = false
 	checkHistory   []CheckResult
-	
-	// Performance: reuse a single http client with optimized settings
-	httpClient = &http.Client{
-		Timeout: 8 * time.Second, // Shorter timeout for faster failures
-		Transport: &http.Transport{
-			MaxIdleConns:        10,
-			MaxIdleConnsPerHost: 10,
-			IdleConnTimeout:     30 * time.Second,
-		},
-	}
-	
-	// Writer channel for batch disk writes
-	seenWriterCh chan string
-	writerWg     sync.WaitGroup
 )
 
-// --- TELEGRAM STRUCTS ---
+// Telegram polling structs
 type TelegramUpdateResponse struct {
 	Ok     bool     `json:"ok"`
 	Result []Update `json:"result"`
@@ -69,7 +64,7 @@ type Chat struct {
 	ID int64 `json:"id"`
 }
 
-// --- API STRUCTS ---
+// API structs
 type OuterEnvelope struct {
 	ProductResponse string `json:"ProductResponse"`
 }
@@ -84,13 +79,15 @@ type Product struct {
 	StockStatus   string `json:"CrntStock"`
 }
 
-// --- HISTORY STRUCT ---
+// History struct
 type CheckResult struct {
 	Timestamp     time.Time
 	FoundProducts []Product
 }
 
-// --- HELPER FUNCTIONS ---
+// -----------------------
+// HELPERS
+// -----------------------
 var nonAlphanumericRegex = regexp.MustCompile(`[^a-zA-Z0-9 ]+`)
 var spaceRegex = regexp.MustCompile(`\s+`)
 
@@ -112,92 +109,86 @@ func sendTelegramMessage(chatID, message string) {
 	payload.Set("chat_id", chatID)
 	payload.Set("text", message)
 	payload.Set("parse_mode", "HTML")
-	
-	// Non-blocking send with timeout
-	go func() {
-		client := &http.Client{Timeout: 5 * time.Second}
-		_, err := client.PostForm(apiURL, payload)
-		if err != nil {
-			log.Printf("❌ Failed to send Telegram message: %v", err)
-		}
-	}()
+	_, err := http.PostForm(apiURL, payload)
+	if err != nil {
+		log.Printf("❌ Failed to send Telegram message: %v", err)
+	}
 }
 
+// -----------------------
+// PERSISTENCE
+// -----------------------
 func loadSeenItems() {
-	f, err := os.Open(SEEN_ITEMS_FILE)
+	data, err := os.ReadFile(SEEN_ITEMS_FILE)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return
+		if !os.IsNotExist(err) {
+			log.Printf("Error reading seen file: %v", err)
 		}
-		log.Printf("Error opening seen items file: %v", err)
 		return
 	}
-	defer f.Close()
-	s := bufio.NewScanner(f)
-	for s.Scan() {
-		line := strings.TrimSpace(s.Text())
+	lines := strings.Split(string(data), "\n")
+	seenItemsMu.Lock()
+	for _, line := range lines {
 		if line != "" {
 			seenItems[line] = true
 		}
 	}
-	if err := s.Err(); err != nil {
-		log.Printf("Scanner error: %v", err)
-	}
-}
-
-// Writer goroutine for async disk writes
-func startSeenWriter(ch <-chan string) {
-	writerWg.Add(1)
-	go func() {
-		defer writerWg.Done()
-		f, err := os.OpenFile(SEEN_ITEMS_FILE, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			log.Printf("Error opening file for writing seen items: %v", err)
-			return
-		}
-		defer f.Close()
-		w := bufio.NewWriter(f)
-		for id := range ch {
-			if _, err := w.WriteString(id + "\n"); err != nil {
-				log.Printf("Error writing seen item: %v", err)
-				continue
-			}
-			w.Flush()
-		}
-		w.Flush()
-	}()
+	seenItemsMu.Unlock()
 }
 
 func saveNewItem(productInfoID string) {
-	select {
-	case seenWriterCh <- productInfoID:
-	default:
-		// Fallback direct write
-		f, err := os.OpenFile(SEEN_ITEMS_FILE, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			log.Printf("Error opening file for writing: %v", err)
-			return
-		}
-		if _, err := f.WriteString(productInfoID + "\n"); err != nil {
-			log.Printf("Error writing to file fallback: %v", err)
-		}
-		f.Close()
+	// Append to disk and in-memory map
+	f, err := os.OpenFile(SEEN_ITEMS_FILE, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("Error opening file for writing: %v", err)
+		return
 	}
+	defer f.Close()
+	if _, err := f.WriteString(productInfoID + "\n"); err != nil {
+		log.Printf("Error writing to file: %v", err)
+		return
+	}
+	seenItemsMu.Lock()
+	seenItems[productInfoID] = true
+	seenItemsMu.Unlock()
 }
 
+// -----------------------
+// GLOBAL HTTP CLIENT (Keep-Alive connections)
+// -----------------------
+var httpClient = &http.Client{
+	Timeout: 20 * time.Second,
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          200,
+		MaxIdleConnsPerHost:   200,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	},
+}
+
+// -----------------------
+// KEEP-ALIVE FOR RENDER
+// -----------------------
+const RENDER_PING_URL = "https://hh2-uaol.onrender.com" // <- your provided render URL
+
+// startKeepAlive will ping your Render URL periodically to reduce spin-down.
+// Warm-up: wait 2 minutes, then ping every 8 minutes (safe cadence).
 func startKeepAlive() {
-	appURL := "https://hh2-uaol.onrender.com"
 	go func() {
-		log.Println("⏰ Keep-alive will start in 2 minutes...")
+		log.Println("⏰ Keep-alive goroutine starting: waiting 2 minutes before first ping...")
 		time.Sleep(2 * time.Minute)
 
 		ticker := time.NewTicker(8 * time.Minute)
 		defer ticker.Stop()
 
-		log.Printf("🔄 Keep-alive service started, pinging: %s", appURL)
-		client := &http.Client{Timeout: 30 * time.Second}
+		client := &http.Client{Timeout: 20 * time.Second}
 
-		resp, err := client.Get(appURL + "/ping")
+		// Initial ping (immediate after warm-up)
+		resp, err := client.Get(RENDER_PING_URL + "/ping")
 		if err != nil {
 			log.Printf("⚠️ Initial keep-alive ping failed: %v", err)
 		} else {
@@ -205,45 +196,49 @@ func startKeepAlive() {
 			log.Printf("✅ Initial keep-alive ping successful (status: %d)", resp.StatusCode)
 		}
 
-		for range ticker.C {
-			resp, err := client.Get(appURL + "/ping")
-			if err != nil {
-				log.Printf("⚠️ Keep-alive ping failed: %v", err)
-			} else {
-				resp.Body.Close()
-				log.Printf("✅ Keep-alive ping successful (status: %d)", resp.StatusCode)
+		for {
+			select {
+			case <-ticker.C:
+				resp, err := client.Get(RENDER_PING_URL + "/ping")
+				if err != nil {
+					log.Printf("⚠️ Keep-alive ping failed: %v", err)
+					// do not crash; we'll try again on next tick
+				} else {
+					resp.Body.Close()
+					log.Printf("✅ Keep-alive ping successful (status: %d)", resp.StatusCode)
+				}
 			}
 		}
 	}()
 }
 
-// --- OPTIMIZED SINGLE PAGE API FETCH ---
-func fetchPage1Products(ctx context.Context) ([]Product, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", API_URL_PAGE_1, nil)
+// -----------------------
+// CORE API LOGIC
+// -----------------------
+func fetchAndParseAPI(apiURL string) ([]Product, error) {
+	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; HotWheelsBot/1.0)")
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Referer", "https://www.firstcry.com/")
-
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("bad status code: %d", resp.StatusCode)
 	}
-	
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	var outer OuterEnvelope
 	if err := json.Unmarshal(body, &outer); err != nil {
+		// Attempt a fallback parse if the response shape is slightly different
 		var altOuter map[string]interface{}
 		if err2 := json.Unmarshal(body, &altOuter); err2 == nil {
 			if respStr, ok := altOuter["ProductResponse"].(string); ok {
@@ -255,57 +250,106 @@ func fetchPage1Products(ctx context.Context) ([]Product, error) {
 			return nil, err
 		}
 	}
-	
 	if outer.ProductResponse == "" {
 		return []Product{}, nil
 	}
-	
 	var inner InnerData
 	if err := json.Unmarshal([]byte(outer.ProductResponse), &inner); err != nil {
 		return nil, err
 	}
-	
 	return inner.Products, nil
 }
 
-// --- CORE LOGIC ---
+// getAllProductsFromAPI fetches page1 then pages 2..PAGES_TO_SCAN concurrently
+func getAllProductsFromAPI() ([]Product, error) {
+	var allProducts []Product
+	seenPInfIDs := make(map[string]bool)
+
+	// PAGE 1 (special)
+	page1Products, err := fetchAndParseAPI(API_URL_PAGE_1)
+	if err != nil {
+		log.Printf("❌ Failed to fetch Page 1: %v", err)
+		// continue to attempt other pages even if page1 failed
+	} else {
+		for _, p := range page1Products {
+			if !seenPInfIDs[p.ProductInfoID] {
+				allProducts = append(allProducts, p)
+				seenPInfIDs[p.ProductInfoID] = true
+			}
+		}
+	}
+
+	// Concurrent fetch for pages 2..PAGES_TO_SCAN
+	var wg sync.WaitGroup
+	resultsCh := make(chan []Product, PAGES_TO_SCAN-1)
+
+	for i := 2; i <= PAGES_TO_SCAN; i++ {
+		i := i
+		wg.Add(1)
+		go func(page int) {
+			defer wg.Done()
+			pagingURL := fmt.Sprintf(API_URL_PAGING_TEMPLATE, page)
+			prods, err := fetchAndParseAPI(pagingURL)
+			if err != nil {
+				log.Printf("❌ Error fetching page %d: %v", page, err)
+				return
+			}
+			if len(prods) == 0 {
+				return
+			}
+			resultsCh <- prods
+		}(i)
+	}
+
+	go func() {
+		wg.Wait()
+		close(resultsCh)
+	}()
+
+	for prods := range resultsCh {
+		for _, p := range prods {
+			if !seenPInfIDs[p.ProductInfoID] {
+				allProducts = append(allProducts, p)
+				seenPInfIDs[p.ProductInfoID] = true
+			}
+		}
+	}
+
+	return allProducts, nil
+}
+
+// -----------------------
+// BOT LOGIC
+// -----------------------
 func initializeBaseline() {
-	log.Println("No baseline file found. Performing initial scan of Page 1...")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	
-	products, err := fetchPage1Products(ctx)
+	log.Println("No baseline file found. Performing definitive multi-API scan...")
+	products, err := getAllProductsFromAPI()
 	if err != nil {
 		log.Printf("❌ Fatal error during baseline creation: %v", err)
 		return
 	}
-	
 	var initialItems []string
 	for _, p := range products {
 		if p.StockStatus != "0" {
 			initialItems = append(initialItems, p.ProductInfoID)
 		}
 	}
-	
 	content := strings.Join(initialItems, "\n")
 	os.WriteFile(SEEN_ITEMS_FILE, []byte(content), 0644)
-	log.Printf("✅ Baseline created with %d IN-STOCK items from Page 1.", len(initialItems))
+	log.Printf("✅ Baseline created with %d IN-STOCK items.", len(initialItems))
 }
 
 func checkForNewItems() []Product {
-	checkStart := time.Now()
+	log.Printf("🔎 (%s) Performing definitive multi-API check...", time.Now().Format("15:04:05"))
 	var newProductsFound []Product
-	
-	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
-	defer cancel()
-	
-	allProducts, err := fetchPage1Products(ctx)
+	allProducts, err := getAllProductsFromAPI()
 	if err != nil {
-		log.Printf("❌ Error fetching Page 1: %v", err)
+		log.Printf("❌ Error getting all products: %v", err)
 		sendTelegramMessage(ADMIN_CHAT_ID, fmt.Sprintf("⚠️ Bot encountered an error: %v", err))
 		return newProductsFound
 	}
 
+	log.Printf("... Total products/variations found this check: %d", len(allProducts))
 	for _, p := range allProducts {
 		if p.StockStatus == "0" {
 			continue
@@ -313,66 +357,63 @@ func checkForNewItems() []Product {
 
 		uniqueID := p.ProductInfoID
 
-		mutex.Lock()
+		seenItemsMu.RLock()
 		seen := seenItems[uniqueID]
-		mutex.Unlock()
+		seenItemsMu.RUnlock()
 
 		if !seen {
-			elapsed := time.Since(checkStart)
-			log.Printf("🚨 NEW ITEM FOUND in %.2fs: %s", elapsed.Seconds(), p.ProductName)
+			log.Printf("🚨 NEW ITEM FOUND: %s", p.ProductName)
 			newProductsFound = append(newProductsFound, p)
 
 			fullURL := constructFullURL(p)
 			message := fmt.Sprintf(
-				"<b>🔥 NEW HOT WHEELS!</b>\n\n<b>%s</b>\n<b>Price:</b> ₹%s\n\n<a href='%s'>🛒 BUY NOW</a>\n\n⚡ Found in %.1fs",
-				p.ProductName, p.Price, fullURL, elapsed.Seconds(),
+				"<b>🔥 New Hot Wheels Listing!</b>\n\n<b>Name:</b> %s\n<b>Price:</b> %s\n\n<b>Link:</b> <a href='%s'>Click Here</a>",
+				p.ProductName, p.Price, fullURL,
 			)
 			sendTelegramMessage(TELEGRAM_CHAT_ID, message)
 
+			// Save to disk & memory
 			saveNewItem(uniqueID)
-			mutex.Lock()
-			seenItems[uniqueID] = true
-			mutex.Unlock()
 		}
 	}
-	
 	return newProductsFound
 }
 
 func scraperWorker(stop chan struct{}) {
-	log.Println("🔥 Starting FAST scraper (5s interval, Page 1 only)...")
-	
 	initialFinds := checkForNewItems()
 	mutex.Lock()
 	checkHistory = append(checkHistory, CheckResult{Timestamp: time.Now(), FoundProducts: initialFinds})
 	mutex.Unlock()
-	
 	if len(initialFinds) == 0 {
-		log.Println("...No new items on initial check.")
+		log.Println("...No new items found (initial check).")
+		sendTelegramMessage(TELEGRAM_CHAT_ID, "✅ No new listings found on initial check.")
 	}
-	
-	ticker := time.NewTicker(5 * time.Second) // Fixed 5-second ticker
-	defer ticker.Stop()
-	
 	for {
+		mutex.Lock()
+		interval := checkInterval
+		paused := isPaused
+		mutex.Unlock()
+
 		select {
-		case <-ticker.C:
-			mutex.Lock()
-			paused := isPaused
-			mutex.Unlock()
-			
+		case <-time.After(interval):
 			if !paused {
 				newlyFoundProducts := checkForNewItems()
 				mutex.Lock()
 				checkHistory = append(checkHistory, CheckResult{Timestamp: time.Now(), FoundProducts: newlyFoundProducts})
-				if len(checkHistory) > 20 {
+				if len(checkHistory) > 10 {
 					checkHistory = checkHistory[1:]
 				}
+				isMuted := heartbeatMuted
+				currentInterval := checkInterval
 				mutex.Unlock()
-				
 				if len(newlyFoundProducts) == 0 {
-					log.Println("✓ Check complete - no new items")
+					log.Println("...No new items found.")
+					if !isMuted {
+						sendTelegramMessage(TELEGRAM_CHAT_ID, fmt.Sprintf("✅ No new listings found. Next check in ~%.0f seconds.", currentInterval.Seconds()))
+					}
 				}
+			} else {
+				log.Println("...Scraper is paused.")
 			}
 		case <-stop:
 			log.Println("Scraper worker shutting down.")
@@ -381,88 +422,94 @@ func scraperWorker(stop chan struct{}) {
 	}
 }
 
+// -----------------------
+// Telegram command listener (polling)
+// -----------------------
 func commandListenerWorker(stop chan struct{}) {
 	log.Println("🤖 Command listener started.")
 	var lastUpdateID int
-	
 	for {
 		apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=10", TELEGRAM_BOT_TOKEN, lastUpdateID+1)
-		resp, err := http.Get(apiURL)
+		resp, err := httpClient.Get(apiURL)
 		if err != nil {
 			log.Printf("Error getting updates: %v", err)
 			time.Sleep(5 * time.Second)
 			continue
 		}
-		
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		
+
 		var updates TelegramUpdateResponse
-		json.Unmarshal(body, &updates)
-		
+		_ = json.Unmarshal(body, &updates) // ignore parse errors (skip)
+
 		for _, update := range updates.Result {
 			lastUpdateID = update.UpdateID
 			if update.Message.Text == "" || update.Message.Chat.ID == 0 {
 				continue
 			}
-			
 			chatIDStr := strconv.FormatInt(update.Message.Chat.ID, 10)
 			if chatIDStr != ADMIN_CHAT_ID {
 				sendTelegramMessage(chatIDStr, "Sorry, you are not authorized.")
 				continue
 			}
-			
 			parts := strings.Fields(update.Message.Text)
 			command := parts[0]
-			
 			switch command {
 			case "/start":
 				mutex.Lock()
 				isPaused = false
 				mutex.Unlock()
-				sendTelegramMessage(ADMIN_CHAT_ID, "▶️ Bot resumed (5s checks).")
-				
+				sendTelegramMessage(ADMIN_CHAT_ID, "▶️ Bot resumed.")
 			case "/pause":
 				mutex.Lock()
 				isPaused = true
 				mutex.Unlock()
 				sendTelegramMessage(ADMIN_CHAT_ID, "⏸️ Bot paused.")
-				
 			case "/stop":
 				sendTelegramMessage(ADMIN_CHAT_ID, "🛑 Stopping bot...")
 				close(stop)
 				return
-				
 			case "/mute":
 				mutex.Lock()
 				heartbeatMuted = true
 				mutex.Unlock()
-				sendTelegramMessage(ADMIN_CHAT_ID, "🔕 Heartbeat muted.")
-				
+				sendTelegramMessage(ADMIN_CHAT_ID, "🔕 Heartbeat notifications muted.")
 			case "/unmute":
 				mutex.Lock()
 				heartbeatMuted = false
 				mutex.Unlock()
-				sendTelegramMessage(ADMIN_CHAT_ID, "🔔 Heartbeat enabled.")
-				
+				sendTelegramMessage(ADMIN_CHAT_ID, "🔔 Heartbeat notifications enabled.")
+			case "/setinterval":
+				if len(parts) > 1 {
+					i, err := strconv.Atoi(parts[1])
+					// allow minimum 5 seconds to match user's request
+					if err == nil && i >= 5 {
+						mutex.Lock()
+						checkInterval = time.Duration(i) * time.Second
+						mutex.Unlock()
+						sendTelegramMessage(ADMIN_CHAT_ID, fmt.Sprintf("✅ Interval set to %d seconds.", i))
+					} else {
+						sendTelegramMessage(ADMIN_CHAT_ID, "❌ Invalid interval. Minimum is 5 seconds.")
+					}
+				} else {
+					sendTelegramMessage(ADMIN_CHAT_ID, "Usage: /setinterval <seconds>")
+				}
 			case "/status":
 				mutex.Lock()
 				status := "▶️ Running"
 				if isPaused {
 					status = "⏸️ Paused"
 				}
-				itemCount := len(seenItems)
+				hbStatus := "🔔 Active"
+				if heartbeatMuted {
+					hbStatus = "🔕 Muted"
+				}
+				interval := checkInterval
 				mutex.Unlock()
-				
-				sendTelegramMessage(ADMIN_CHAT_ID, fmt.Sprintf(
-					"<b>⚡ FAST MODE STATUS</b>\n\n%s\nCheck Interval: 5 seconds\nPage 1 Only: ✅\nTracked Items: %d\n\n🎯 Optimized for instant notifications!",
-					status, itemCount,
-				))
-				
+				sendTelegramMessage(ADMIN_CHAT_ID, fmt.Sprintf("<b>Bot Status:</b>\n%s\nCheck Interval: %.0f seconds\nHeartbeat: %s", status, interval.Seconds(), hbStatus))
 			case "/recent":
 				var sb strings.Builder
-				sb.WriteString("<b>🔎 Recent Finds (Last 20 Checks)</b>\n\n")
-				
+				sb.WriteString("<b>🔎 Recent Finds (Last 10 Checks)</b>\n\n")
 				mutex.Lock()
 				totalFound := 0
 				for i := len(checkHistory) - 1; i >= 0; i-- {
@@ -470,173 +517,118 @@ func commandListenerWorker(stop chan struct{}) {
 					if len(result.FoundProducts) > 0 {
 						totalFound += len(result.FoundProducts)
 						loc, _ := time.LoadLocation("Asia/Kolkata")
-						sb.WriteString(fmt.Sprintf("<b>Found at %s:</b>\n", result.Timestamp.In(loc).Format("03:04:05 PM")))
+						sb.WriteString(fmt.Sprintf("<b><u>Found at %s:</u></b>\n", result.Timestamp.In(loc).Format("03:04 PM, Jan 02")))
 						for _, p := range result.FoundProducts {
 							fullURL := constructFullURL(p)
-							sb.WriteString(fmt.Sprintf("• <a href='%s'>%s</a> - ₹%s\n", fullURL, p.ProductName, p.Price))
+							sb.WriteString(fmt.Sprintf("- <a href='%s'>%s</a>\n", fullURL, p.ProductName))
 						}
 						sb.WriteString("\n")
 					}
 				}
 				mutex.Unlock()
-				
 				if totalFound == 0 {
-					sb.WriteString("No new products found in recent checks.")
+					sb.WriteString("No new products found in the last 10 checks.")
 				}
 				sendTelegramMessage(ADMIN_CHAT_ID, sb.String())
-				
-			case "/cleanup":
-				sendTelegramMessage(ADMIN_CHAT_ID, "🧹 Starting cleanup verification...")
-				
-				// Fetch current products from Page 1
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				currentProducts, err := fetchPage1Products(ctx)
-				cancel()
-				
-				if err != nil {
-					sendTelegramMessage(ADMIN_CHAT_ID, fmt.Sprintf("❌ Cleanup failed: %v", err))
-					continue
-				}
-				
-				// Build map of currently active product IDs
-				activeIDs := make(map[string]bool)
-				for _, p := range currentProducts {
-					if p.StockStatus != "0" {
-						activeIDs[p.ProductInfoID] = true
-					}
-				}
-				
-				mutex.Lock()
-				beforeCount := len(seenItems)
-				
-				// Remove IDs that are no longer in stock/available
-				for id := range seenItems {
-					if !activeIDs[id] {
-						delete(seenItems, id)
-					}
-				}
-				
-				afterCount := len(seenItems)
-				removed := beforeCount - afterCount
-				
-				// Rewrite the file with only active items
-				var activeItems []string
-				for id := range seenItems {
-					activeItems = append(activeItems, id)
-				}
-				mutex.Unlock()
-				
-				content := strings.Join(activeItems, "\n")
-				err = os.WriteFile(SEEN_ITEMS_FILE, []byte(content), 0644)
-				
-				if err != nil {
-					sendTelegramMessage(ADMIN_CHAT_ID, fmt.Sprintf("❌ Failed to write cleaned file: %v", err))
-				} else {
-					sendTelegramMessage(ADMIN_CHAT_ID, fmt.Sprintf(
-						"✅ <b>Cleanup Complete!</b>\n\n"+
-							"Before: %d items\n"+
-							"After: %d items\n"+
-							"Removed: %d inactive items\n\n"+
-							"File optimized and ready!",
-						beforeCount, afterCount, removed,
-					))
-				}
-				
-			case "/reset":
-				sendTelegramMessage(ADMIN_CHAT_ID, "⚠️ Are you sure? Reply with /confirmreset to reset the entire baseline.")
-				
-			case "/confirmreset":
-				mutex.Lock()
-				seenItems = make(map[string]bool)
-				mutex.Unlock()
-				
-				// Delete the file
-				os.Remove(SEEN_ITEMS_FILE)
-				
-				// Rebuild baseline
-				initializeBaseline()
-				loadSeenItems()
-				
-				sendTelegramMessage(ADMIN_CHAT_ID, fmt.Sprintf(
-					"🔄 <b>Baseline Reset Complete!</b>\n\nNew baseline created with %d items from Page 1.",
-					len(seenItems),
-				))
 			}
 		}
 	}
 }
 
-func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.Println("--- 🔥 Hot Wheels Hunter FAST MODE (5s/Page 1) 🔥 ---")
+// -----------------------
+// HTTP Server for Render /health, /status, /ping
+// -----------------------
+func startHTTPServer() {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
 
-	// HTTP server for Render
-	go func() {
-		port := os.Getenv("PORT")
-		if port == "" {
-			port = "8080"
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("🔥 Hot Wheels Hunter is running! 🔥"))
+	})
+
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		mutex.Lock()
+		status := "running"
+		if isPaused {
+			status = "paused"
 		}
+		interval := checkInterval
+		itemCount := 0
+		seenItemsMu.RLock()
+		itemCount = len(seenItems)
+		seenItemsMu.RUnlock()
+		mutex.Unlock()
 
-		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("🔥 Hot Wheels Hunter FAST MODE - 5 Second Checks! 🔥"))
-		})
+		response := fmt.Sprintf(`{
+			"status": "%s",
+			"check_interval_seconds": %.0f,
+			"tracked_items": %d,
+			"bot": "Hot Wheels Hunter",
+			"timestamp": "%s"
+		}`, status, interval.Seconds(), itemCount, time.Now().Format("2006-01-02 15:04:05"))
 
-		http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-			mutex.Lock()
-			status := "running"
-			if isPaused {
-				status = "paused"
-			}
-			itemCount := len(seenItems)
-			mutex.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(response))
+	})
 
-			response := fmt.Sprintf(`{
-				"status": "%s",
-				"check_interval_seconds": 5,
-				"mode": "fast_page1_only",
-				"tracked_items": %d,
-				"bot": "Hot Wheels Hunter FAST",
-				"timestamp": "%s"
-			}`, status, itemCount, time.Now().Format("2006-01-02 15:04:05"))
+	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("pong"))
+	})
 
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(response))
-		})
+	server := &http.Server{
+		Addr:    ":" + port,
+		Handler: mux,
+	}
 
-		http.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("pong"))
-		})
-
+	go func() {
 		log.Printf("🌐 HTTP server starting on port %s", port)
-		if err := http.ListenAndServe(":"+port, nil); err != nil {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("❌ HTTP server error: %v", err)
 		}
 	}()
+}
 
+// -----------------------
+// MAIN
+// -----------------------
+func main() {
+	// Logging
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	log.Println("--- 🔥 Hot Wheels Hunter Started (Render-ready) 🔥 ---")
+
+	// Start HTTP server for Render
+	startHTTPServer()
+
+	// Start keepalive self-pings (to your render URL)
 	startKeepAlive()
 
-	seenWriterCh = make(chan string, 100)
-	startSeenWriter(seenWriterCh)
-
+	// Load baseline or create it
 	if _, err := os.Stat(SEEN_ITEMS_FILE); os.IsNotExist(err) {
 		initializeBaseline()
 	}
-	
 	loadSeenItems()
-	log.Printf("✅ Loaded baseline with %d items.", len(seenItems))
-	log.Println("⚡ FAST MODE: Checking Page 1 every 5 seconds for instant notifications!")
-	
+	seenItemsMu.RLock()
+	log.Printf("✅ Loaded baseline: %d items tracked.", len(seenItems))
+	seenItemsMu.RUnlock()
+
+	// Channels for graceful shutdown via /stop telegram command
 	stop := make(chan struct{})
+
+	// Start workers: scraper and telegram command listener
 	go scraperWorker(stop)
 	go commandListenerWorker(stop)
-	
-	sendTelegramMessage(ADMIN_CHAT_ID, "🚀 Bot FAST MODE Online!\n\n⚡ 5-second checks\n📄 Page 1 only\n🎯 Instant notifications")
 
+	// Notify admin
+	sendTelegramMessage(ADMIN_CHAT_ID, "🚀 Bot is online and running!")
+
+	// Block until stop channel is closed
 	<-stop
-	close(seenWriterCh)
-	writerWg.Wait()
-	log.Println("--- Bot has been shut down. ---")
+	log.Println("--- Bot shutdown complete ---")
 }
