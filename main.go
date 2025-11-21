@@ -20,13 +20,13 @@ const (
 )
 
 var (
-	checkInterval   = 5 * time.Second
-	lastCheck       = time.Now()
-	productsSeen    = make(map[string]Product)
-	mutex           sync.Mutex
-	telegramToken   = os.Getenv("TELEGRAM_TOKEN")
+	checkInterval    = 5 * time.Second
+	lastCheck        = time.Now()
+	productsSeen     = make(map[string]Product)
+	mutex            sync.Mutex
+	telegramToken    = os.Getenv("TELEGRAM_TOKEN")
 	TELEGRAM_CHAT_ID = os.Getenv("TELEGRAM_CHAT_ID")
-	heartbeatMuted  = true
+	heartbeatMuted   = true
 )
 
 type Product struct {
@@ -51,8 +51,8 @@ type SearchResponse struct {
 }
 
 type CheckResult struct {
-	Timestamp     time.Time
-	FoundProducts []Product
+	Timestamp     time.Time `json:"timestamp"`
+	FoundProducts []Product `json:"products"`
 }
 
 var checkHistory []CheckResult
@@ -77,6 +77,8 @@ func sendTelegramMessage(chatID string, msg string) {
 	defer resp.Body.Close()
 }
 
+// --------- FIXED FETCH FUNCTION WITH HTML/JSON DETECTION -----------
+
 func fetchPage(apiURL string, page int) ([]Product, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
 
@@ -86,7 +88,9 @@ func fetchPage(apiURL string, page int) ([]Product, error) {
 		return nil, err
 	}
 
-	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+	req.Header.Set("Accept", "application/json")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -95,11 +99,21 @@ func fetchPage(apiURL string, page int) ([]Product, error) {
 	defer resp.Body.Close()
 
 	bodyBytes, _ := io.ReadAll(resp.Body)
+	bodyStr := strings.TrimSpace(string(bodyBytes))
+
+	// Detect HTML instead of JSON (Render or FirstCry block)
+	if strings.HasPrefix(bodyStr, "<") {
+		log.Println("❌ HTML received instead of JSON:")
+		log.Println(bodyStr[:min(400, len(bodyStr))])
+		return nil, fmt.Errorf("HTML response received instead of JSON")
+	}
 
 	var res SearchResponse
 	err = json.Unmarshal(bodyBytes, &res)
 	if err != nil {
-		return nil, err
+		log.Println("❌ JSON parse error. Response was:")
+		log.Println(bodyStr[:min(400, len(bodyStr))])
+		return nil, fmt.Errorf("unmarshal error: %v", err)
 	}
 
 	products := []Product{}
@@ -115,6 +129,15 @@ func fetchPage(apiURL string, page int) ([]Product, error) {
 
 	return products, nil
 }
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// -------------------------------------------------------------------
 
 func scrapeAllPages() ([]Product, error) {
 	all := []Product{}
@@ -174,7 +197,7 @@ func scraperWorker() {
 		}
 
 		if !isMuted {
-			// No heartbeat message
+			// heartbeat disabled permanently
 		}
 
 		for _, p := range newlyFound {
