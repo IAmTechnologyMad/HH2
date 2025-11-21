@@ -409,7 +409,7 @@ func scraperWorker(stop chan struct{}) {
 				if len(newlyFoundProducts) == 0 {
 					log.Println("...No new items found.")
 					if !isMuted {
-						sendTelegramMessage(TELEGRAM_CHAT_ID, fmt.Sprintf("✅ No new listings found. Next check in ~%.0f seconds.", currentInterval.Seconds()))
+						//sendTelegramMessage(TELEGRAM_CHAT_ID, fmt.Sprintf("✅ No new listings found. Next check in ~%.0f seconds.", currentInterval.Seconds()))
 					}
 				}
 			} else {
@@ -632,3 +632,4 @@ func main() {
 	<-stop
 	log.Println("--- Bot shutdown complete ---")
 }
+
