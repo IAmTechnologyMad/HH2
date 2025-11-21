@@ -8,8 +8,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,15 +26,15 @@ var (
 	mutex           sync.Mutex
 	telegramToken   = os.Getenv("TELEGRAM_TOKEN")
 	TELEGRAM_CHAT_ID = os.Getenv("TELEGRAM_CHAT_ID")
-	heartbeatMuted  = true // Always muted
+	heartbeatMuted  = true
 )
 
 type Product struct {
-	ID          string
-	Title       string
-	Image       string
-	Price       float64
-	Link        string
+	ID    string
+	Title string
+	Image string
+	Price float64
+	Link  string
 }
 
 type SearchResponse struct {
@@ -167,6 +165,7 @@ func scraperWorker() {
 		if len(checkHistory) > 10 {
 			checkHistory = checkHistory[1:]
 		}
+
 		mutex.Unlock()
 
 		if len(newlyFound) == 0 {
@@ -175,12 +174,14 @@ func scraperWorker() {
 		}
 
 		if !isMuted {
-			// No heartbeat message (intentionally removed)
+			// No heartbeat message
 		}
 
 		for _, p := range newlyFound {
-			msg := fmt.Sprintf("🔥 *New Hot Wheels Found!*\n\nName: %s\nPrice: ₹%.0f\nLink: %s",
-				p.Title, p.Price, p.Link)
+			msg := fmt.Sprintf(
+				"🔥 *New Hot Wheels Found!*\n\nName: %s\nPrice: ₹%.0f\nLink: %s",
+				p.Title, p.Price, p.Link,
+			)
 			sendTelegramMessage(TELEGRAM_CHAT_ID, msg)
 		}
 	}
